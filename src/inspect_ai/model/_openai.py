@@ -1101,6 +1101,17 @@ def openai_should_retry(ex: BaseException) -> bool:
     return openai_classify_retry(ex) is not None
 
 
+class EmptyResponseError(Exception):
+    """A provider returned a 'successful' response with no usable content.
+
+    Observed with some OpenAI-compatible providers (e.g. OpenRouter) which can
+    return a 200 with no choices/content/tool-calls and no usage after the
+    upstream connection struggled (e.g. following ConnectTimeouts). These are
+    not real generations, so we classify them as transient and retry — a clean
+    retry reliably returns a real response.
+    """
+
+
 def openai_classify_retry(ex: BaseException) -> "RetryDecision | None":
     """Classify an OpenAI SDK exception as rate_limit / transient / not retryable.
 
@@ -1110,6 +1121,8 @@ def openai_classify_retry(ex: BaseException) -> "RetryDecision | None":
     """
     from inspect_ai.model._model import RetryDecision
 
+    if isinstance(ex, EmptyResponseError):
+        return RetryDecision.transient()
     if isinstance(ex, RateLimitError):
         return RetryDecision.rate_limit(
             retry_after=parse_retry_after_from_exception(ex)

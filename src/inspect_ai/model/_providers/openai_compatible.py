@@ -20,7 +20,11 @@ from typing_extensions import override
 
 from inspect_ai._util.logger import warn_once
 from inspect_ai.log._samples import set_active_model_event_call
-from inspect_ai.model._openai import chat_choices_from_openai, openai_classify_retry
+from inspect_ai.model._openai import (
+    EmptyResponseError,
+    chat_choices_from_openai,
+    openai_classify_retry,
+)
 from inspect_ai.model._openai_responses import ResponsesModelInfo
 from inspect_ai.model._providers.openai_responses import generate_responses
 from inspect_ai.model._providers.util.chatapi import (
@@ -258,6 +262,18 @@ class OpenAICompatibleAPI(ModelAPI):
                 )
                 self.on_response(response)
 
+                # guard against degenerate "empty" 200s: a response with no
+                # usable content/tool-calls AND no usage. Some OpenAI-compatible
+                # providers (e.g. OpenRouter) return these after the upstream
+                # connection struggled (e.g. post-ConnectTimeout). They are not
+                # real generations; raise so the retry loop re-generates (a clean
+                # retry reliably returns a real response).
+                if _completion_is_empty(completion):
+                    raise EmptyResponseError(
+                        "Empty response (no content, tool calls, or usage) from "
+                        f"{self.service_model_name()}"
+                    )
+
                 # get choices
                 choices = self.chat_choices_from_completion(completion, tools)
 
@@ -432,6 +448,26 @@ def _resolve_chat_choice(
             return choice
     else:
         return choice
+
+
+def _completion_is_empty(completion: ChatCompletion) -> bool:
+    """A degenerate, non-generation 200: no content, no tool calls, no usage.
+
+    A real generation always reports usage, so absent/zero usage combined with
+    no content and no tool calls signals a non-response (observed from
+    OpenRouter after the upstream connection struggled). Requiring *all three*
+    keeps legitimate responses (empty content + a tool call, or empty content
+    with real usage) from being treated as empty.
+    """
+    usage = completion.usage
+    if usage is not None and (usage.total_tokens or 0) > 0:
+        return False
+    if not completion.choices:
+        return True
+    message = completion.choices[0].message
+    has_content = bool(getattr(message, "content", None))
+    has_tool_calls = bool(getattr(message, "tool_calls", None))
+    return not has_content and not has_tool_calls
 
 
 class ModelInfo(ResponsesModelInfo):
